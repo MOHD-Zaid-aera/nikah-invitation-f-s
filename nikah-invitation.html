@@ -988,7 +988,7 @@
     <div class="card-tap-hint">Tap to Open</div>
   </div>
 </div>
-<audio id="invitationMusic" src="nikah-music.mp3" preload="auto" loop></audio>
+<audio id="invitationMusic" src="nikah-music.mp3" preload="auto" loop playsinline></audio>
 <button class="music-toggle" id="musicToggle" type="button" aria-label="Play music" aria-pressed="false">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
     <path id="musicPlayIcon" d="m9 6 10 6-10 6V6Z" hidden></path>
@@ -1266,7 +1266,8 @@ function renderContacts(prefix, list){
 }
 renderContacts("nikah", CONTACTS.nikah);
 
-/* Music starts from the card-opening gesture, which also satisfies browser autoplay policies. */
+/* Music starts from the card-opening gesture, which also satisfies browser autoplay policies.
+   If a phone blocks or delays that first attempt, the next tap anywhere on the page retries it. */
 const invitationMusic = (function(){
   const audio = document.getElementById("invitationMusic");
   const toggle = document.getElementById("musicToggle");
@@ -1275,20 +1276,33 @@ const invitationMusic = (function(){
   const pauseIcon = document.getElementById("musicPauseIcon");
   const status = document.getElementById("musicStatus");
   const targetVolume = 0.55;
+  const retryEvents = ["touchend", "click", "keydown"];
   let fadeFrame = 0;
+  let wantsMusic = false;   // true once the guest opened the card, false after they press pause
+  let retryArmed = false;
+
+  // iOS Safari ignores script-set volume, so a fade-in from 0 must not be relied on there.
+  const canControlVolume = (function(){
+    try{
+      const probe = document.createElement("audio");
+      probe.volume = 0.5;
+      return probe.volume === 0.5;
+    }catch(e){ return false; }
+  })();
 
   function updatePlaybackUi(){
     const isPlaying = !audio.paused;
     toggle.classList.toggle("is-playing", isPlaying);
     toggle.setAttribute("aria-pressed", String(isPlaying));
     toggle.setAttribute("aria-label", isPlaying ? "Pause music" : "Play music");
-    toggleText.textContent = isPlaying ? "Pause music" : "Play music";
+    toggleText.textContent = isPlaying ? "Pause music" : (retryArmed ? "Tap to play music" : "Play music");
     playIcon.hidden = isPlaying;
     pauseIcon.hidden = !isPlaying;
   }
 
   function fadeIn(){
     if(fadeFrame) cancelAnimationFrame(fadeFrame);
+    if(!canControlVolume){ audio.volume = 1; return; }
     const startingVolume = audio.volume;
     const startedAt = performance.now();
     const duration = 1400;
@@ -1307,23 +1321,48 @@ const invitationMusic = (function(){
     fadeFrame = requestAnimationFrame(step);
   }
 
+  function onRetryGesture(e){
+    if(e.target && e.target.closest && e.target.closest("#musicToggle")) return; // toggle handles itself
+    disarmRetry();
+    if(wantsMusic && audio.paused) play();
+  }
+  function armRetry(){
+    if(retryArmed) return;
+    retryArmed = true;
+    retryEvents.forEach(ev => document.addEventListener(ev, onRetryGesture, true));
+  }
+  function disarmRetry(){
+    if(!retryArmed) return;
+    retryArmed = false;
+    retryEvents.forEach(ev => document.removeEventListener(ev, onRetryGesture, true));
+  }
+
   function play(){
-    audio.play().then(() => {
-      if(!audio.paused){
-        fadeIn();
-      }
+    wantsMusic = true;
+    // A previous network error leaves the element unusable until it is reloaded.
+    if(audio.error) audio.load();
+    if(canControlVolume && audio.volume > 0.05 && audio.paused) audio.volume = 0;
+    let attempt;
+    try{
+      attempt = audio.play();
+    }catch(e){
+      attempt = Promise.reject(e);
+    }
+    if(!attempt || typeof attempt.then !== "function") return; // very old browsers
+    attempt.then(() => {
+      disarmRetry();
+      fadeIn();
+      updatePlaybackUi();
     }).catch(() => {
-      if(audio.error){
-        status.textContent = "Music could not be loaded. Check that nikah-music.mp3 is available.";
-        toggle.disabled = true;
-      } else {
-        status.textContent = "Music could not start automatically. Press play to try again.";
-      }
+      if(!wantsMusic) return;
+      status.textContent = "Music could not start. Tap anywhere to play.";
+      document.body.classList.add("music-ready");
+      armRetry();
       updatePlaybackUi();
     });
   }
 
-  audio.volume = 0;
+  audio.volume = canControlVolume ? 0 : 1;
   audio.addEventListener("play", () => {
     status.textContent = "Music is playing.";
     updatePlaybackUi();
@@ -1335,16 +1374,28 @@ const invitationMusic = (function(){
     updatePlaybackUi();
   });
   audio.addEventListener("error", () => {
-    status.textContent = "Music could not be loaded. Check that nikah-music.mp3 is available.";
-    toggle.disabled = true;
+    if(!wantsMusic) return;
+    status.textContent = "Music could not be loaded. Tap anywhere to try again.";
+    document.body.classList.add("music-ready");
+    armRetry();
     updatePlaybackUi();
   });
   toggle.addEventListener("click", () => {
+    disarmRetry();
     if(audio.paused){
       play();
     } else {
+      wantsMusic = false;
       audio.pause();
     }
+  });
+
+  // Phones pause audio when the guest switches apps or locks the screen; resume when they return.
+  document.addEventListener("visibilitychange", () => {
+    if(document.visibilityState === "visible" && wantsMusic && audio.paused) play();
+  });
+  window.addEventListener("pageshow", (e) => {
+    if(e.persisted && wantsMusic && audio.paused) play();
   });
 
   return { start: play };
